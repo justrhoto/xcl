@@ -1280,6 +1280,48 @@ mod pipeline_cap_tests {
         assert_eq!((capped, made, refused), (1, 0, 0));
         assert!(!path.exists(), "rejected blob should not be retried next run");
     }
+
+    /// A program the runtime runs split gets its pieces' and its whole form's pipelines on the
+    /// dispatch chain's root signature, kept where the runtime looks for them (`.chain.pso`).
+    #[test]
+    fn a_split_program_keeps_the_blobs_of_its_pieces_and_whole_as_chain_blobs() {
+        use super::{Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-chain-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        let program = |v: u32| {
+            let hlsl = format!("RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() {{ mem.Store(0, {v}); }}");
+            recomp::dxc::compile(&hlsl, "main", "cs_6_6", &[]).expect("DXC compile")
+        };
+        let (first, second, whole) = (program(1), program(2), program(3));
+        let plan = crate::gpu::dxil::kernel::DispatchChain { pieces: vec![first.clone(), second.clone()], dwords_per_group: 1 };
+        let c = recomp::pso::Compiled { dispatch_chain: Some(std::sync::Arc::new(plan)), dxil: whole.clone(), samplers: vec![] };
+        pipelines.make_in(&c, Some(&scratch.0));
+        assert_eq!((pipelines.made.load(Ordering::Relaxed), pipelines.refused.load(Ordering::Relaxed)), (3, 0));
+        for (what, dxil) in [("first piece", &first), ("second piece", &second), ("whole", &whole)] {
+            let plain = scratch.0.join(driver_cache::name(dxil, 0));
+            assert!(plain.with_extension("chain.pso").is_file(), "the {what}'s blob is kept as a chain blob");
+            assert!(!plain.exists(), "no plain blob for the {what}: the runtime never asks for one");
+        }
+    }
 }
 
 // D3D12 devices and root signatures are free-threaded
@@ -1302,17 +1344,46 @@ impl Pipelines {
 
     /// The compute pipeline of `c` (made and released).
     fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
+        self.make_in(c, None);
+    }
+
+    /// `c`'s pipelines as the runtime makes them, their blobs in `dir` (None: the driver cache).
+    /// A program the runtime runs split (`dispatch_chain`, two pieces or more) has a pipeline
+    /// for each piece and one for the whole program, all on the dispatch chain's root signature
+    /// and kept as `.chain.pso` (`real::compute_container`): a title made ~70 of those, 11 – 20 s
+    /// each, one after another, when only the plain form had been made here.
+    fn make_in(&self, c: &recomp::pso::Compiled, dir: Option<&std::path::Path>) {
+        use crate::hle::d3d12x::real::driver_cache;
+        let path = |dxil: &[u8], chain: bool| match dir {
+            Some(d) => Some(d.join(driver_cache::name(dxil, 0))),
+            None => driver_cache::path(dxil, 0),
+        }
+        .map(|p| if chain { p.with_extension("chain.pso") } else { p });
+        match c.dispatch_chain.as_deref().filter(|plan| plan.pieces.len() >= 2) {
+            Some(plan) => {
+                for piece in plan.pieces.iter().chain([&c.dxil]) {
+                    self.make_one(piece, &c.samplers, true, path(piece, true));
+                }
+            }
+            None => self.make_one(&c.dxil, &c.samplers, false, path(&c.dxil, false)),
+        }
     }
 
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        use crate::hle::d3d12x::real::driver_cache;
+        self.make_one(&c.dxil, &c.samplers, false, path_override.or_else(|| driver_cache::path(&c.dxil, 0)));
+    }
+
+    /// One pipeline of `dxil` on XCL's ABI root signature (`chain`: the dispatch chain's), its
+    /// driver blob read from and written to `path`.
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chain: bool, path: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
-        let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let key: Vec<u32> = [chain as u32].into_iter().chain(samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32]))).collect();
         let rs = {
             let mut g = self.signatures.lock().unwrap();
             match g.get(&key) {
                 Some(rs) => rs.clone(),
-                None => match recomp::pso::abi_root_signature_with(&self.dev, true, &c.samplers) {
+                None => match if chain { recomp::pso::dispatch_chain_root_signature(&self.dev, samplers) } else { recomp::pso::abi_root_signature_with(&self.dev, true, samplers) } {
                     Ok(rs) => {
                         g.insert(key, rs.clone());
                         rs
@@ -1326,19 +1397,18 @@ impl Pipelines {
         };
         let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
-        let path = path_override.or_else(|| driver_cache::path(&c.dxil, desc.Flags.0));
         let cached = path.as_deref().and_then(driver_cache::load);
-        let over_cap = self.max_dxil != 0 && c.dxil.len() > self.max_dxil;
+        let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
         // when a title needs the pipeline. `XCL_PIPELINE_MAX_KB` 0 turns the cap off.
         if cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
@@ -1366,7 +1436,7 @@ impl Pipelines {
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
