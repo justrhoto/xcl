@@ -3831,7 +3831,21 @@ pub(super) fn compile(src: &str, target: &str) -> Vec<u8> {
         );
         match (r, blob) {
             (Ok(()), Some(b)) => std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec(),
-            _ => Vec::new(),
+            // Wine's D3DCompile (vkd3d-shader) refuses some of these programs (the ExecuteIndirect
+            // guard's, on CrossOver): DXC, which XCL loads anyway, at the shader model 6 profile
+            _ => {
+                let sm6 = target.replace("_5_0", "_6_0").replace("_5_1", "_6_0");
+                match crate::gpu::recomp::dxc::compile(src, "main", &sm6, &[]) {
+                    Ok(dxil) => {
+                        crate::xlog_info!("D3D12.X: an internal {target} program did not compile with D3DCompile; compiled with DXC as {sm6}");
+                        dxil
+                    }
+                    Err(e) => {
+                        crate::xlog_warn!("D3D12.X: an internal {target} program compiles neither with D3DCompile nor with DXC: {e}");
+                        Vec::new()
+                    }
+                }
+            }
         }
     }
 }
