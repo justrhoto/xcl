@@ -893,7 +893,7 @@ mod tests {
         let mut at = seed * 37 % size.div_ceil(PAGE) * PAGE;
         let mut n = seed;
         while at < size && out.len() < 6 {
-            n = n * 1103515245 + 12345;
+            n = n.wrapping_mul(1103515245).wrapping_add(12345);
             let to = (at + PAGE * (1 + n / 65536 % 4)).min(size);
             out.push((at, to));
             at = to + PAGE * (1 + n / 16 % (size / PAGE / 5 + 2));
